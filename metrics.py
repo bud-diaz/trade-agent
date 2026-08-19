@@ -50,12 +50,14 @@ def compute_metrics(result) -> dict:
     sell_trades = [t for t in trades if t["side"] == "sell"]
     n_trades = len(sell_trades)
 
-    wins = losses = 0
-    gross_win = gross_loss = 0.0
-    # naive P&L pairing note: for precise per-trade P&L, compute realized_pl
-    # per sell at apply-time in portfolio.py rather than reconstructing here.
-    # This block gives trade *count* stats reliably; win/loss $ amounts are
-    # approximate unless you wire through per-fill realized P&L explicitly.
+    # realized_pl is recorded per-sell at apply-time in portfolio.py, so
+    # win/loss stats here are exact, not reconstructed/approximate.
+    sell_trades_with_pl = [t for t in sell_trades if t.get("realized_pl") is not None]
+    wins = [t["realized_pl"] for t in sell_trades_with_pl if t["realized_pl"] > 0]
+    losses = [t["realized_pl"] for t in sell_trades_with_pl if t["realized_pl"] <= 0]
+    win_rate_pct = round(100 * len(wins) / len(sell_trades_with_pl), 2) if sell_trades_with_pl else None
+    avg_win_usd = round(sum(wins) / len(wins), 2) if wins else None
+    avg_loss_usd = round(sum(losses) / len(losses), 2) if losses else None
 
     return {
         "starting_equity": round(starting, 2),
@@ -66,6 +68,9 @@ def compute_metrics(result) -> dict:
         "sharpe_ratio": round(sharpe, 2) if sharpe is not None else None,
         "sortino_ratio": round(sortino, 2) if sortino is not None else None,
         "num_trades": n_trades,
+        "win_rate_pct": win_rate_pct,
+        "avg_win_usd": avg_win_usd,
+        "avg_loss_usd": avg_loss_usd,
         "num_rejected_signals": len(result.rejected_signals),
         "realized_pl_total": round(result.portfolio.realized_pl_total, 2),
         "days_backtested": days,

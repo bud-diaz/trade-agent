@@ -63,7 +63,20 @@ class RiskGate:
 
     def evaluate(self, signal: Signal, portfolio, current_prices: dict[str, float],
                  now_ts: Optional[float] = None) -> RiskDecision:
-        now_ts = now_ts if now_ts is not None else time.time()
+        if now_ts is None:
+            # Backtests replay years of history in under a second of real
+            # wall-clock time. If time-based rules (data freshness, the
+            # rejection cooldown/blacklist) fell back to time.time(), a
+            # symbol blacklisted early in a backtest would never see its
+            # cooldown expire before the run finishes, silently freezing it
+            # out for the rest of the backtest. Fall back to the portfolio's
+            # last mark-to-market timestamp (simulated "now") when available;
+            # only use real wall-clock time if there's no simulated time to
+            # anchor to yet (e.g. live trading, or the very first bar).
+            if portfolio.equity_curve:
+                now_ts = portfolio.equity_curve[-1][0]
+            else:
+                now_ts = time.time()
         results: list[RuleResult] = []
 
         # Kill switch check first — if halted, nothing else matters
@@ -83,7 +96,7 @@ class RiskGate:
                 self.consecutive_rejections[signal.symbol] = 0
 
         results.append(self._check_data_freshness(signal, now_ts))
-        results.append(self._check_price_sanity(signal, current_prices))
+        results.append(self._check_price_sanity(signal, current_prices, now_ts))
         results.append(self._check_sufficient_holdings(signal, portfolio))
         results.append(self._check_max_position_size(signal, portfolio, current_prices))
         results.append(self._check_max_order_value(signal, current_prices))
@@ -109,7 +122,7 @@ class RiskGate:
             return RuleResult("data_freshness", False, f"data is {age:.0f}s old, max {self.config.max_data_staleness_seconds}s")
         return RuleResult("data_freshness", True, f"data is {age:.0f}s old")
 
-    def _check_price_sanity(self, signal: Signal, current_prices: dict[str, float]) -> RuleResult:
+    def _check_price_sanity(self, signal: Signal, current_prices: dict[str, float], now_ts: float) -> RuleResult:
         price = current_prices.get(signal.symbol)
         if price is None:
             return RuleResult("price_sanity", False, "no current price available")
@@ -125,7 +138,7 @@ class RiskGate:
 
         # update tracked price regardless of pass/fail on other rules
         self.last_known_prices[signal.symbol] = price
-        self.last_price_update_ts[signal.symbol] = time.time()
+        self.last_price_update_ts[signal.symbol] = now_ts
         return RuleResult("price_sanity", True, f"price {price} within tolerance")
 
     def _check_sufficient_holdings(self, signal: Signal, portfolio) -> RuleResult:

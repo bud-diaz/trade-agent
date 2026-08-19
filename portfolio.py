@@ -137,6 +137,7 @@ class Portfolio:
             "qty": fill.qty,
             "price": fill.price,
             "fee": fill.fee,
+            "realized_pl": realized if fill.side == "sell" else None,
         })
 
     def mark_to_market(self, timestamp: int, current_prices: dict[str, float], day_key: str) -> None:
