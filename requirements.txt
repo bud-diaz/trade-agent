@@ -3,3 +3,4 @@ numpy
 yfinance
 ccxt
 python-dotenv
+streamlit>=1.61,<2

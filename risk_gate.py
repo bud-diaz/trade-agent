@@ -268,6 +268,21 @@ class RiskGate:
     def record_trade_executed(self) -> None:
         self.daily_trade_count += 1
 
+    def record_price(self, symbol: str, price: float, now_ts: Optional[float] = None) -> None:
+        """Update the price/freshness trackers outside of a full evaluate()
+        call. evaluate() only runs on actionable (non-hold) signals, and
+        _check_price_sanity only updates last_known_prices/last_price_update_ts
+        as a side effect of running — so for an infrequent-signal strategy,
+        those trackers would otherwise go stale for as long as the gap
+        between trades, making price_sanity/data_freshness compare against a
+        weeks-old anchor instead of a recent one. Callers (the live loop)
+        should call this on every cycle that does NOT also call evaluate()
+        this same cycle — never both, or price_sanity would compare a price
+        against itself instead of the previous observation."""
+        now_ts = now_ts if now_ts is not None else time.time()
+        self.last_known_prices[symbol] = price
+        self.last_price_update_ts[symbol] = now_ts
+
     def _finalize(self, signal: Signal, results: list[RuleResult], now_ts: float) -> RiskDecision:
         approved = all(r.passed for r in results)
 

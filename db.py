@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS signals (
     confidence REAL,
     suggested_qty REAL,
     inputs_json TEXT,                -- snapshot of indicator values that drove this
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    bar_timestamp INTEGER            -- price_history bar that produced this signal; live-loop idempotency watermark
 );
 
 CREATE TABLE IF NOT EXISTS risk_evaluations (
@@ -67,7 +68,8 @@ CREATE TABLE IF NOT EXISTS orders (
     submitted_at INTEGER NOT NULL,
     filled_at INTEGER,
     filled_price REAL,
-    filled_qty REAL
+    filled_qty REAL,
+    fee REAL DEFAULT 0.0             -- needed to replay orders through Portfolio.apply_fill and get correct cash
 );
 
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -77,7 +79,8 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     cash REAL NOT NULL,
     unrealized_pl REAL,
     realized_pl_today REAL,
-    open_position_count INTEGER
+    open_position_count INTEGER,
+    symbol TEXT                      -- each symbol trades its own independent paper Portfolio
 );
 
 CREATE TABLE IF NOT EXISTS system_state (
@@ -93,6 +96,12 @@ CREATE TABLE IF NOT EXISTS system_state (
 
 def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
+    # WAL: one long-lived writer (live_loop.py) and a dashboard that rereads
+    # constantly is exactly WAL's use case — readers don't block the writer.
+    # busy_timeout gives SQLite a few seconds to retry instead of raising
+    # "database is locked" on a rare write/write collision.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
@@ -102,6 +111,41 @@ def init_db(conn: sqlite3.Connection) -> None:
     """Create all tables/indexes if they don't already exist. Safe to call
     every startup."""
     conn.executescript(_SCHEMA)
+    conn.commit()
+    _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS won't retroactively add columns to a table
+    that already exists. Safe to call every startup — each step checks
+    before acting."""
+    signals_cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
+    if "bar_timestamp" not in signals_cols:
+        conn.execute("ALTER TABLE signals ADD COLUMN bar_timestamp INTEGER")
+
+    orders_cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+    if "fee" not in orders_cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN fee REAL DEFAULT 0.0")
+
+    snapshot_cols = {r[1] for r in conn.execute("PRAGMA table_info(portfolio_snapshots)")}
+    if "symbol" not in snapshot_cols:
+        conn.execute("ALTER TABLE portfolio_snapshots ADD COLUMN symbol TEXT")
+    # index creation is separate from (and always runs after) the ALTER TABLE
+    # above: on a fresh install the column already exists via _SCHEMA's
+    # CREATE TABLE, so the ALTER TABLE branch never fires there, but the
+    # index still needs creating either way.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_symbol_ts "
+        "ON portfolio_snapshots(symbol, timestamp)"
+    )
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO system_state
+            (id, trading_halted, halt_reason, halted_at, daily_trade_count, last_reset_date)
+        VALUES (1, 0, NULL, NULL, 0, NULL)
+        """
+    )
     conn.commit()
 
 
