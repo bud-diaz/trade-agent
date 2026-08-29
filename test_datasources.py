@@ -137,7 +137,9 @@ def test_ccxt_raises_on_no_data(monkeypatch):
 # AlpacaDataSource
 # ------------------------------------------------------------------
 
-def test_alpaca_stub_raises_with_key_hint():
+def test_alpaca_missing_keys_raises_with_key_hint(monkeypatch):
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
     src = AlpacaDataSource()
-    with pytest.raises(NotImplementedError, match="ALPACA_API_KEY"):
+    with pytest.raises(DataSourceError, match="ALPACA_API_KEY"):
         src.fetch_ohlcv("AAPL", datetime(2024, 1, 1), datetime(2024, 1, 4))

@@ -69,7 +69,16 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_at INTEGER,
     filled_price REAL,
     filled_qty REAL,
-    fee REAL DEFAULT 0.0             -- needed to replay orders through Portfolio.apply_fill and get correct cash
+    fee REAL DEFAULT 0.0,            -- needed to replay orders through Portfolio.apply_fill and get correct cash
+    client_order_id TEXT UNIQUE,
+    broker_status TEXT,
+    submitted_broker_at INTEGER,
+    updated_broker_at INTEGER,
+    last_reconciled_at INTEGER,
+    avg_fill_price REAL,
+    remaining_qty REAL,
+    error_message TEXT,
+    raw_broker_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -89,7 +98,8 @@ CREATE TABLE IF NOT EXISTS system_state (
     halt_reason TEXT,
     halted_at INTEGER,
     daily_trade_count INTEGER DEFAULT 0,
-    last_reset_date TEXT
+    last_reset_date TEXT,
+    last_daily_summary_date TEXT
 );
 """
 
@@ -124,8 +134,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signals ADD COLUMN bar_timestamp INTEGER")
 
     orders_cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
-    if "fee" not in orders_cols:
-        conn.execute("ALTER TABLE orders ADD COLUMN fee REAL DEFAULT 0.0")
+    order_migrations = {
+        "fee": "ALTER TABLE orders ADD COLUMN fee REAL DEFAULT 0.0",
+        "client_order_id": "ALTER TABLE orders ADD COLUMN client_order_id TEXT",
+        "broker_status": "ALTER TABLE orders ADD COLUMN broker_status TEXT",
+        "submitted_broker_at": "ALTER TABLE orders ADD COLUMN submitted_broker_at INTEGER",
+        "updated_broker_at": "ALTER TABLE orders ADD COLUMN updated_broker_at INTEGER",
+        "last_reconciled_at": "ALTER TABLE orders ADD COLUMN last_reconciled_at INTEGER",
+        "avg_fill_price": "ALTER TABLE orders ADD COLUMN avg_fill_price REAL",
+        "remaining_qty": "ALTER TABLE orders ADD COLUMN remaining_qty REAL",
+        "error_message": "ALTER TABLE orders ADD COLUMN error_message TEXT",
+        "raw_broker_json": "ALTER TABLE orders ADD COLUMN raw_broker_json TEXT",
+    }
+    for col, sql in order_migrations.items():
+        if col not in orders_cols:
+            conn.execute(sql)
+
+    state_cols = {r[1] for r in conn.execute("PRAGMA table_info(system_state)")}
+    if "last_daily_summary_date" not in state_cols:
+        conn.execute("ALTER TABLE system_state ADD COLUMN last_daily_summary_date TEXT")
 
     snapshot_cols = {r[1] for r in conn.execute("PRAGMA table_info(portfolio_snapshots)")}
     if "symbol" not in snapshot_cols:
@@ -138,12 +165,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_symbol_ts "
         "ON portfolio_snapshots(symbol, timestamp)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_broker_status "
+        "ON orders(broker, status)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_order_id "
+        "ON orders(client_order_id) WHERE client_order_id IS NOT NULL"
+    )
 
     conn.execute(
         """
         INSERT OR IGNORE INTO system_state
-            (id, trading_halted, halt_reason, halted_at, daily_trade_count, last_reset_date)
-        VALUES (1, 0, NULL, NULL, 0, NULL)
+            (id, trading_halted, halt_reason, halted_at, daily_trade_count, last_reset_date, last_daily_summary_date)
+        VALUES (1, 0, NULL, NULL, 0, NULL, NULL)
         """
     )
     conn.commit()

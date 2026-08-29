@@ -4,3 +4,5 @@ yfinance
 ccxt
 python-dotenv
 streamlit>=1.61,<2
+alpaca-py>=0.42,<1
+requests>=2.32,<3

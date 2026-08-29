@@ -1,0 +1,17 @@
+[Unit]
+Description=Trade Agent live execution loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/bud/trade-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/bud/trade-agent/.venv/bin/python /home/bud/trade-agent/live_loop.py
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

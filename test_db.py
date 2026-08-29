@@ -37,6 +37,21 @@ def test_init_db_creates_all_tables(conn):
     assert EXPECTED_TABLES <= table_names
 
 
+def test_orders_table_has_reconciliation_columns(conn):
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    assert {
+        "client_order_id",
+        "broker_status",
+        "submitted_broker_at",
+        "updated_broker_at",
+        "last_reconciled_at",
+        "avg_fill_price",
+        "remaining_qty",
+        "error_message",
+        "raw_broker_json",
+    } <= cols
+
+
 def test_init_db_is_idempotent(conn):
     # calling again must not raise or duplicate anything
     init_db(conn)

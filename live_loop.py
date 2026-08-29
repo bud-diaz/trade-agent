@@ -23,8 +23,15 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 import live_state as ls
+import orders as order_repo
+from alerts import DiscordAlertClient, alert_error, alert_fill, alert_shutdown, alert_startup
+from broker_factory import make_broker_for_asset
+from brokers import OrderIntent
+from config import load_config
 from db import get_connection, init_db, load_price_history
 from datasources import get_data_source, upsert_price_history
+from reconcile import reconcile_open_orders
+from summaries import maybe_send_daily_summary
 from strategy_ma_rsi import make_strategy
 from risk_gate import RiskGate, RiskConfig
 from fills import simulate_fill
@@ -121,7 +128,41 @@ def _insert_portfolio_snapshot(conn, portfolio, symbol: str, ts: int, current_pr
     )
 
 
-def _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_ts, bar_close, now_ts, day_key):
+def _symbol_slug(symbol: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in symbol).strip("-")
+
+
+def _make_order_intent(signal, cfg: dict, bar_ts: int) -> OrderIntent:
+    return OrderIntent(
+        symbol=signal.symbol,
+        asset_type=cfg["asset_type"],
+        side=signal.action,
+        qty=float(signal.suggested_qty),
+        order_type="market",
+        client_order_id=f"ta-{_symbol_slug(signal.symbol)}-{bar_ts}-{signal.action}",
+    )
+
+
+def _record_simulated_order(signal_id: int, cfg: dict, fill, now_ts: int) -> dict:
+    return {
+        "signal_id": signal_id,
+        "broker": "paper",
+        "broker_order_id": None,
+        "symbol": cfg["symbol"],
+        "side": fill.side,
+        "qty": fill.qty,
+        "order_type": "market",
+        "limit_price": None,
+        "status": "filled",
+        "submitted_at": now_ts,
+        "filled_at": fill.timestamp,
+        "filled_price": fill.price,
+        "filled_qty": fill.qty,
+        "fee": fill.fee,
+    }
+
+
+def _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_ts, bar_close, now_ts, day_key, app_config=None, broker_clients=None, alert_client=None):
     symbol = cfg["symbol"]
     signal = strategy_fn(history)
 
@@ -151,22 +192,51 @@ def _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_
             if signal.action == "buy" and not portfolio.can_afford(fill.qty, fill.price, fill.fee):
                 rule_results.append({"rule_name": "insufficient_cash", "passed": False, "detail": "live guard"})
             else:
-                portfolio.apply_fill(fill, asset_type=cfg["asset_type"])
-                order_row = {
-                    "broker": "paper",
-                    "broker_order_id": None,
-                    "symbol": symbol,
-                    "side": fill.side,
-                    "qty": fill.qty,
-                    "order_type": "market",
-                    "limit_price": None,
-                    "status": "filled",
-                    "submitted_at": now_ts,
-                    "filled_at": fill.timestamp,
-                    "filled_price": fill.price,
-                    "filled_qty": fill.qty,
-                    "fee": fill.fee,
-                }
+                if app_config is not None and app_config.broker_execution_enabled:
+                    # Defer portfolio mutation until broker reconciliation confirms a fill.
+                    intent = _make_order_intent(signal, cfg, bar_ts)
+                    broker = (broker_clients or {}).get(cfg["asset_type"])
+                    if broker is None:
+                        broker = make_broker_for_asset(cfg["asset_type"], app_config)
+                    if broker_clients is not None:
+                        broker_clients[broker.broker_name] = broker
+                        broker_clients[cfg["asset_type"]] = broker
+                    existing = order_repo.get_order_by_client_order_id(conn, intent.client_order_id)
+                    order_repo.create_pending_order(
+                        conn, signal_id=None, broker=broker.broker_name, symbol=symbol, side=signal.action,
+                        qty=signal.suggested_qty, order_type="market", client_order_id=intent.client_order_id, submitted_at=now_ts,
+                    )
+                    if existing and existing.get("broker_order_id"):
+                        state = broker.get_order(existing.get("broker_order_id"), intent.client_order_id, symbol)
+                    elif existing and existing.get("status") != "pending_submit":
+                        state = broker.get_order(existing.get("broker_order_id"), intent.client_order_id, symbol)
+                    else:
+                        try:
+                            state = broker.get_order(client_order_id=intent.client_order_id, symbol=symbol)
+                        except Exception:
+                            state = broker.submit_order(intent)
+                    order_repo.mark_order_submitted(
+                        conn, client_order_id=intent.client_order_id, broker_order_id=state.broker_order_id,
+                        broker_status=state.status, raw_broker_json=state.raw, now_ts=now_ts,
+                    )
+                    updated = order_repo.update_order_from_broker(
+                        conn, broker=state.broker, broker_order_id=state.broker_order_id, client_order_id=state.client_order_id,
+                        broker_status=state.status, filled_qty=state.filled_qty, avg_fill_price=state.avg_fill_price,
+                        remaining_qty=state.remaining_qty, raw_broker_json=state.raw, now_ts=now_ts,
+                        error_message=state.error_message,
+                    )
+                    if state.status in {"filled", "partially_filled"} and state.filled_qty > 0 and state.avg_fill_price is not None:
+                        from portfolio import Fill
+                        portfolio.apply_fill(
+                            Fill(symbol=symbol, side=signal.action, qty=state.filled_qty, price=state.avg_fill_price, fee=0.0, timestamp=now_ts),
+                            asset_type=cfg["asset_type"],
+                        )
+                    if state.status in {"filled", "partially_filled"} and alert_client is not None:
+                        alert_fill(alert_client, state)
+                    order_row = None
+                else:
+                    portfolio.apply_fill(fill, asset_type=cfg["asset_type"])
+                    order_row = _record_simulated_order(None, cfg, fill, now_ts)
 
     signal_id = _insert_signal(conn, {
         "symbol": symbol,
@@ -183,18 +253,21 @@ def _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_
     if order_row is not None:
         order_row["signal_id"] = signal_id
         _insert_order(conn, order_row)
+    elif app_config is not None and app_config.broker_execution_enabled and signal.action != "hold":
+        intent = _make_order_intent(signal, cfg, bar_ts)
+        conn.execute("UPDATE orders SET signal_id = ? WHERE client_order_id = ?", (signal_id, intent.client_order_id))
     _insert_portfolio_snapshot(conn, portfolio, symbol, now_ts, {symbol: bar_close})
     conn.commit()
 
     if signal.action != "hold":
         logger.info(
             "%s: %s signal, approved=%s%s",
-            symbol, signal.action, order_row is not None,
-            "" if order_row else f" rejected={[r['rule_name'] for r in rule_results if not r['passed']]}",
+            symbol, signal.action, decision.approved,
+            "" if decision.approved else f" rejected={[r['rule_name'] for r in rule_results if not r['passed']]}",
         )
 
 
-def _run_cycle(conn, cfg: dict, portfolio, risk_gate, strategy_fn, latest_prices: dict) -> None:
+def _run_cycle(conn, cfg: dict, portfolio, risk_gate, strategy_fn, latest_prices: dict, app_config=None, broker_clients=None, alert_client=None) -> None:
     symbol = cfg["symbol"]
     now_ts = int(time.time())
 
@@ -229,7 +302,7 @@ def _run_cycle(conn, cfg: dict, portfolio, risk_gate, strategy_fn, latest_prices
         conn.commit()
         return
 
-    _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_ts, bar_close, now_ts, day_key)
+    _process_new_bar(conn, portfolio, risk_gate, strategy_fn, cfg, history, bar_ts, bar_close, now_ts, day_key, app_config, broker_clients, alert_client)
 
 
 def main():
@@ -238,6 +311,9 @@ def main():
     args = parser.parse_args()
 
     load_dotenv(".env.local")
+    app_config = load_config()
+    alert_client = DiscordAlertClient(app_config.discord_webhook_url)
+    alert_startup(alert_client, app_config)
     conn = get_connection()
     init_db(conn)
 
@@ -247,6 +323,10 @@ def main():
     risk_gate = RiskGate(RiskConfig(
         max_data_staleness_seconds=LIVE_MAX_STALENESS_SECONDS,
         max_price_deviation_pct=LIVE_MAX_PRICE_DEVIATION_PCT,
+        enforce_market_hours=app_config.broker_execution_enabled,
+        allow_extended_hours=app_config.allow_extended_hours,
+        market_timezone=app_config.market_timezone,
+        max_correlated_exposure_pct=app_config.max_correlated_exposure_pct,
     ))
     ls.sync_risk_gate_halt(conn, risk_gate)
     state = ls.get_system_state(conn)
@@ -261,26 +341,44 @@ def main():
     }
 
     shutdown = threading.Event() if args.once else _install_shutdown_event()
+    broker_clients = {}
+    asset_types = {cfg["symbol"]: cfg["asset_type"] for cfg in ls.SYMBOLS}
+    for portfolio in portfolios.values():
+        portfolio.linked_portfolios = portfolios
+    if app_config.broker_execution_enabled:
+        for asset_type in sorted(set(asset_types.values())):
+            broker = make_broker_for_asset(asset_type, app_config)
+            broker_clients[broker.broker_name] = broker
+            broker_clients[asset_type] = broker
 
     while True:
         today = datetime.now(timezone.utc).date().isoformat()
         ls.maybe_roll_daily_counters(conn, risk_gate, today)
         ls.sync_risk_gate_halt(conn, risk_gate)
 
+        if app_config.broker_execution_enabled:
+            for change in reconcile_open_orders(conn, broker_clients, portfolios, asset_types):
+                state = change.get("state")
+                if state is not None and change.get("filled_delta", 0) > 0:
+                    alert_fill(alert_client, state)
+
         for cfg in ls.SYMBOLS:
             symbol = cfg["symbol"]
             try:
-                _run_cycle(conn, cfg, portfolios[symbol], risk_gate, strategy_fns[symbol], latest_prices)
-            except Exception:
+                _run_cycle(conn, cfg, portfolios[symbol], risk_gate, strategy_fns[symbol], latest_prices, app_config, broker_clients, alert_client)
+            except Exception as exc:
                 logger.exception("cycle failed for %s, continuing", symbol)
+                alert_error(alert_client, symbol, exc)
 
         ls.push_risk_gate_state(conn, risk_gate, int(time.time()))
+        maybe_send_daily_summary(conn, alert_client, portfolios, latest_prices)
 
         if args.once:
             break
         if shutdown.wait(POLL_INTERVAL_SECONDS):
             break
 
+    alert_shutdown(alert_client)
     conn.close()
     logger.info("live_loop stopped")
 

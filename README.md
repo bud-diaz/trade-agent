@@ -1,77 +1,70 @@
 # trade-agent
 
-An automated trading agent, built backtest-first. The backtester and the live
-paper-trading loop call the *same* strategy, risk gate, and fill simulation
-code — nothing is forked between them, because that is how a backtest ends up
-lying to you.
+An automated trading agent, built backtest-first. The backtester and live loop call the same strategy and risk-gate code paths — nothing is forked between them, because that is how a backtest ends up lying to you.
 
-The system currently runs end to end on real market data, in paper mode only.
-No broker order is ever placed and no broker credentials are used.
+The default mode is **simulated**. Real broker execution is opt-in and protected by explicit safety gates.
 
 ## Overview
 
 Signals flow in one direction, and every order has to clear the risk gate:
 
-```
-data source ──▶ SQLite ──▶ strategy ──▶ risk gate ──▶ fill simulation ──▶ portfolio
-(yfinance,     (price_     (signal)    (approve/       (slippage+fees)   (cash/positions)
- ccxt)          history)                reject)               │
-                                           │                  ▼
-                                           └──────────▶ SQLite audit trail
-                                                        (signals, risk_evaluations,
-                                                         orders, portfolio_snapshots)
-                                                                  │
-                                                                  ▼
-                                                        Streamlit dashboard
+```text
+data source ──▶ SQLite ──▶ strategy ──▶ risk gate ──▶ execution ──▶ reconciliation ──▶ portfolio
+(yfinance,     (price_     (signal)    (approve/     (sim or      (broker state)   (fills)
+ ccxt,          history)                reject)       broker)
+ Alpaca)                                  │                         │
+                                          └────────▶ SQLite audit trail
+                                                     (signals, risk_evaluations,
+                                                      orders, snapshots, state)
 ```
 
-The strategy never touches execution directly. It emits a `Signal`; the risk
-gate turns that into a `RiskDecision`; only approved signals become fills.
-Every signal is persisted — including the ones the gate rejects, along with the
-per-rule results that rejected them — so every decision has an audit trail.
+The strategy never touches execution directly. It emits a `Signal`; the risk gate returns a `RiskDecision`; only approved signals become simulated fills or broker order intents. In broker execution mode, local portfolio state is updated from broker-confirmed filled quantities, not from optimistic submit calls.
 
-Two entry points share that pipeline:
+Two entry points share the core pipeline:
 
-- **`run_backtest.py`** — replays years of historical bars as fast as the CPU
-  allows, writes CSV/plot output.
-- **`live_loop.py`** — polls live prices on an interval, simulates fills against
-  the latest bar, and persists state so it can be restarted without losing
-  position.
+- **`run_backtest.py`** — replays historical bars, writes CSV/plot output.
+- **`live_loop.py`** — polls live prices, evaluates new closed bars, and either simulates fills or submits broker orders depending on `EXECUTION_MODE`.
 
-### Modules
+## Modules
 
 | File | What it does |
 | --- | --- |
 | `engine.py` | Bar-by-bar backtest loop. Defines the `Signal` and `RiskDecision` contracts, feeds the strategy history up to the current bar only, and fills approved orders against the **next** bar's open. |
-| `strategy_ma_rsi.py` | Moving-average crossover with an RSI filter. `make_strategy(params, equity_lookup)` returns a `strategy_fn`; parameters come from a config dict so they can be swept without editing the file. |
-| `risk_gate.py` | Hard limits between signal and order: position size, order value, cash buffer, price sanity, data freshness, open positions, daily-loss kill switch, daily trade count, and per-symbol cooldown after repeated rejections. Each rule is independent and logs its own result. |
+| `strategy_ma_rsi.py` | Moving-average crossover with RSI filter. `make_strategy(params, equity_lookup)` returns a strategy function. |
+| `risk_gate.py` | Hard limits between signal and order: position size, order value, cash buffer, price sanity, data freshness, open positions, daily-loss kill switch, daily trade count, market-hours checks, correlated exposure caps, and per-symbol cooldown after repeated rejections. |
 | `portfolio.py` | Virtual portfolio state — cash, positions, realized/unrealized P&L, equity curve, trade log with per-sell realized P&L. |
-| `fills.py` | Simulated execution. Applies slippage (always adverse) and fees in basis points. |
+| `fills.py` | Simulated execution. Applies adverse slippage and fees. |
 | `metrics.py` | Total return, CAGR, max drawdown, Sharpe, Sortino, win rate, average win/loss, trade counts. |
-| `datasources.py` | Pluggable OHLCV sources behind one interface, all normalized to int unix-epoch **seconds** UTC: `YFinanceDataSource` (stocks, retries with backoff), `CcxtDataSource` (crypto via Coinbase Exchange, paginated), `AlpacaDataSource` (stub — needs API keys). |
-| `db.py` | SQLite schema and persistence: `price_history`, `signals`, `risk_evaluations`, `orders`, `portfolio_snapshots`, `system_state`. WAL mode so the dashboard can read while the loop writes. `init_db()` is idempotent and migrates existing databases. |
-| `live_state.py` | Shared state between the loop and the dashboard: rebuilds portfolios by replaying filled orders, tracks the last-processed bar, and owns the halt/daily-counter round trip so both processes agree on what "halted" means. |
-| `live_loop.py` | The live paper-trading loop. Polls, detects new closed bars, evaluates, simulates fills, persists everything. Handles SIGINT/SIGTERM cleanly. |
-| `dashboard.py` | Streamlit UI: positions, equity, recent signals, trade blotter, price history, plus Emergency Halt / Reset Kill Switch buttons. Read-only against trading logic. |
-| `run_backtest.py` | Runnable backtest over real historical data for AAPL and BTC/USD. |
-| `report.py` | Printed summary plus `equity_curve.csv` / `trade_log.csv` (and a plot when matplotlib is available) under `backtest_output/`. |
-| `smoke_test.py`, `test_strategy_and_risk.py` | Synthetic-data scripts that print a backtest summary. Run directly, not via pytest. |
-| `test_datasources.py`, `test_db.py`, `test_live_state.py`, `test_risk_gate.py` | pytest suite. All network calls mocked — runs fully offline. |
-| `Trade agent notes.md` | Design notes: architecture, risk-rule rationale, schema, intended build order. |
+| `datasources.py` | Pluggable OHLCV sources normalized to UTC epoch seconds: `YFinanceDataSource`, `CcxtDataSource`, and `AlpacaDataSource` via `alpaca-py`. |
+| `db.py` | SQLite schema and persistence. WAL mode for live loop + dashboard. `init_db()` is idempotent and migrates existing databases. |
+| `orders.py` | SQLite order repository helpers for idempotent local order records and broker status updates. |
+| `brokers.py` | Broker-neutral `OrderIntent`, `BrokerOrderState`, and `BrokerClient` protocol. |
+| `alpaca_broker.py` | Alpaca stock order submission/reconciliation client. |
+| `ccxt_broker.py` | ccxt crypto order submission/reconciliation client. Paper broker mode requires ccxt sandbox mode. |
+| `broker_factory.py` | Routes stock intents to Alpaca and crypto intents to ccxt, with safety guards. |
+| `reconcile.py` | Polls broker order state, updates SQLite, and applies confirmed fill deltas to portfolios. |
+| `alerts.py` | Discord webhook client and alert helpers for startup, shutdown, fills, errors, and summaries. |
+| `summaries.py` | Daily trading summary generation and once-per-day Discord dispatch marker. |
+| `live_state.py` | Shared state between loop and dashboard: reconstructs portfolios from confirmed filled quantities, tracks last processed bar, and syncs halt/daily counters. |
+| `live_loop.py` | Long-running/single-pass live loop. Default simulated mode needs no broker credentials. |
+| `dashboard.py` | Streamlit UI: positions, equity, recent signals, trade blotter, price history, Emergency Halt / Reset Kill Switch. |
+| `run_backtest.py` | Runnable backtest over historical data for configured symbols. |
+| `report.py` | Printed summary plus CSV/plot output under `backtest_output/`. |
+| `deploy/` | systemd user service template, installer, and runbook. |
+| `docs/plans/2026-08-28-real-broker-execution.md` | Implementation plan for broker execution work. |
 
-### Design rules the code holds to
+## Design rules
 
 - **No lookahead.** The strategy only ever sees `price_data.iloc[:i+1]`.
-- **No filling on the signal bar.** Backtest orders fill at the next bar's open,
-  since you cannot trade at the price that triggered the signal.
-- **Slippage and fees always applied**, and always against you.
-- **The risk gate is not tunable at runtime.** Changing a limit means editing
-  `RiskConfig` and restarting — the strategy engine cannot influence it.
-- **The kill switch latches.** Once a daily-loss halt trips it stays tripped,
-  persisted in `system_state`, until manually reset. It does not clear overnight.
-- **Restarts don't double-fire.** The loop only acts on *closed* bars newer than
-  the last one recorded in `signals.bar_timestamp`, and rebuilds positions by
-  replaying filled orders.
+- **No filling on the signal bar in backtests.** Backtest orders fill at the next bar's open.
+- **Slippage and fees are applied in simulated execution.**
+- **Broker state is authoritative for broker execution.** A submitted order does not change local portfolio state until the broker reports filled quantity.
+- **Order IDs are deterministic.** The live loop uses stable `client_order_id` values so crash/retry paths can reconcile instead of blindly duplicating.
+- **Default mode is safe.** `EXECUTION_MODE=simulated` requires no broker keys.
+- **Paper broker mode is guarded.** Stock orders force Alpaca paper mode; crypto broker execution requires `CCXT_SANDBOX=true`.
+- **Live mode is deliberately annoying.** It requires `LIVE_TRADING_CONFIRM=I_UNDERSTAND_THIS_TRADES_REAL_MONEY`.
+- **The kill switch latches.** Once a daily-loss halt trips, it stays tripped in `system_state` until manually reset.
+- **Secrets stay out of git.** Put real keys only in `.env.local`.
 
 ## Installation
 
@@ -82,70 +75,61 @@ git clone https://github.com/bud-diaz/trade-agent.git
 cd trade-agent
 
 python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
-pip install -r requirements.txt          # runtime
-pip install -r requirements-dev.txt      # runtime + pytest
-pip install matplotlib                   # optional: equity-curve PNGs
+pip install -r requirements.txt -r requirements-dev.txt
+pip install matplotlib  # optional: equity-curve PNGs
 ```
 
-No credentials are needed. yfinance and the ccxt/Coinbase public endpoints are
-unauthenticated. `.env.local.example` exists only as a placeholder for the
-not-yet-implemented Alpaca source:
+Create local env only if needed:
 
 ```bash
-cp .env.local.example .env.local         # optional; .env.local is gitignored
+cp .env.local.example .env.local
 ```
 
-Never commit real keys — `.env.local`, `*.db`, and `backtest_output/` are all
-gitignored.
+Never commit real keys — `.env.local`, `*.db`, and `backtest_output/` are gitignored.
 
-### Verify the install
+## Verify the install
 
-The test suite is fully offline, so run it first:
+The pytest suite is fully offline, so run it first:
 
 ```bash
-pytest
+python -m pytest -q
 ```
 
-22 tests should pass. Then the two synthetic-data scripts, which exercise the
-engine end to end without touching the network:
+Run the synthetic-data scripts if desired:
 
 ```bash
-python smoke_test.py                 # plumbing only: ~28 fills, 0 rejections
-python test_strategy_and_risk.py     # real strategy + real gate, with rejections
+python smoke_test.py
+python test_strategy_and_risk.py
 ```
 
-Seeing rejected signals in the second one is the point — it means the gate is
-doing its job.
+Run the live loop once in safe simulated mode:
+
+```bash
+EXECUTION_MODE=simulated python live_loop.py --once
+```
+
+This should exit without broker credentials.
 
 ## Running it
 
-### Backtest on real historical data
+### Backtest on historical data
 
 ```bash
 python run_backtest.py
 ```
 
-Fetches two years of daily bars for AAPL (yfinance) and BTC/USD
-(ccxt/Coinbase), stores them in `trade_agent.db`, runs both through the
-strategy and risk gate, and writes `backtest_output/<symbol>/equity_curve.csv`
-and `trade_log.csv`. Re-running is idempotent — `price_history` dedupes on
-`UNIQUE(symbol, timestamp, source)`, so only genuinely new bars are inserted.
+Fetches historical bars, stores them in `trade_agent.db`, runs them through the strategy and risk gate, and writes output under `backtest_output/`. Re-running is idempotent because `price_history` dedupes on `UNIQUE(symbol, timestamp, source)`.
 
-Requires outbound network access to Yahoo Finance and `api.exchange.coinbase.com`.
-Both sources fail loudly rather than returning a partial dataset that would
-quietly produce a wrong backtest.
-
-### Live paper trading
+### Live loop
 
 ```bash
-python live_loop.py --once     # one pass over both symbols, then exit
+python live_loop.py --once     # one pass over configured symbols, then exit
 python live_loop.py            # continuous, 5-minute poll, Ctrl-C to stop
 ```
 
-Simulated fills only. A failed fetch for one symbol is logged and the loop
-continues with the other rather than dying.
+With no env changes, this is simulated only. A failed fetch for one symbol is logged and the loop continues with the others.
 
 ### Dashboard
 
@@ -153,33 +137,22 @@ continues with the other rather than dying.
 streamlit run dashboard.py
 ```
 
-Reads the same SQLite database while the loop is running. The Emergency Halt
-button writes to `system_state`; the loop picks it up at the top of its next
-cycle and stops trading until the kill switch is reset.
+Reads the same SQLite database while the loop is running. The Emergency Halt button writes to `system_state`; the loop picks it up at the top of its next cycle and stops trading until reset.
 
 ## Configuration
 
-Three places to tune, all plain dicts/dataclasses:
+Core tuning lives in plain dicts/dataclasses:
 
 | What | Where |
 | --- | --- |
-| Strategy parameters (MA periods, RSI thresholds, position size) | `DEFAULT_PARAMS` in `strategy_ma_rsi.py` |
+| Strategy parameters | `DEFAULT_PARAMS` in `strategy_ma_rsi.py` |
 | Risk limits | `RiskConfig` in `risk_gate.py` |
 | Symbols, sources, starting cash | `SYMBOLS` / `STARTING_CASH_PER_SYMBOL` in `live_state.py` |
+| Runtime broker/alert mode | `.env.local` via `config.py` |
 
-Poll interval, slippage, and fees are module constants at the top of
-`live_loop.py`.
+Poll interval, slippage, and simulated fees are module constants at the top of `live_loop.py`.
 
-**One deliberate difference between backtest and live risk config:**
-`data_freshness` and `price_sanity` are live-feed *health* checks — they catch a
-stale feed or a corrupted tick. Neither failure mode exists when replaying clean
-historical data, and their live defaults would reject nearly every signal in a
-backtest by mistaking normal multi-week price drift for a bad tick. So
-`run_backtest.py` relaxes those two, and only those two. Every portfolio-risk
-rule — position size, order value cap, cash buffer, open positions, daily-loss
-kill switch, trade count, cooldown — stays at its real default in both modes.
-
-## Writing your own backtest
+## Running your own backtest
 
 ```python
 import pandas as pd
@@ -214,35 +187,125 @@ print(result.summary())
 print(result.rejected_signals)
 ```
 
-`BacktestEngine` runs one symbol per instance — for multi-symbol tests, run one
-engine per symbol and merge the equity curves. That restriction is deliberate:
-it keeps lookahead bugs easy to spot.
+`BacktestEngine` runs one symbol per instance. The live loop handles configured symbols separately but links their portfolios for correlated exposure checks.
 
-## Status and roadmap
+## Live execution configuration
+
+Create `.env.local` from `.env.local.example` and keep the default safe mode unless you are intentionally testing broker execution:
+
+```env
+EXECUTION_MODE=simulated
+```
+
+### Paper broker mode
+
+Paper broker mode routes stocks through Alpaca paper trading. Crypto broker execution is disabled unless ccxt sandbox/testnet mode is explicitly enabled, because many ccxt exchanges use real accounts by default.
+
+```env
+EXECUTION_MODE=paper_broker
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+ALPACA_PAPER=true
+CRYPTO_EXCHANGE_ID=coinbaseexchange
+CCXT_API_KEY=
+CCXT_SECRET=
+CCXT_PASSWORD=
+CCXT_SANDBOX=true
+DISCORD_WEBHOOK_URL=
+ALLOW_EXTENDED_HOURS=false
+MAX_CORRELATED_EXPOSURE_PCT=0.35
+MARKET_TIMEZONE=America/New_York
+```
+
+Safety behavior in `paper_broker`:
+
+- `ALPACA_PAPER=false` is rejected.
+- `CCXT_SANDBOX=false` is rejected for crypto broker execution.
+- Stock execution enforces regular market hours unless `ALLOW_EXTENDED_HOURS` is set.
+- Broker fills are reconciled before being applied locally.
+
+### Live mode
+
+Live mode can place real-money orders. Do not use it until paper broker mode has run cleanly through restarts and reconciliation checks.
+
+```env
+EXECUTION_MODE=live
+LIVE_TRADING_CONFIRM=I_UNDERSTAND_THIS_TRADES_REAL_MONEY
+ALPACA_PAPER=false
+CCXT_SANDBOX=false
+```
+
+If the confirmation string is missing or wrong, startup fails fast.
+
+## Alerts and summaries
+
+Set `DISCORD_WEBHOOK_URL` to enable Discord webhook alerts. The agent sends:
+
+- startup alerts;
+- shutdown alerts;
+- fill alerts;
+- per-symbol execution errors;
+- one daily summary after 21:00 UTC, guarded by `system_state.last_daily_summary_date` so restarts do not spam duplicate summaries.
+
+If `DISCORD_WEBHOOK_URL` is empty, alert calls are no-ops.
+
+## systemd deployment
+
+The service template lives at `deploy/trade-agent.service` and runs:
+
+```bash
+/home/bud/trade-agent/.venv/bin/python /home/bud/trade-agent/live_loop.py
+```
+
+Install as a user service:
+
+```bash
+cd /home/bud/trade-agent
+./deploy/install-systemd-user-service.sh
+```
+
+Operate it with:
+
+```bash
+systemctl --user start trade-agent.service
+systemctl --user stop trade-agent.service
+systemctl --user restart trade-agent.service
+systemctl --user status trade-agent.service --no-pager
+journalctl --user -u trade-agent.service -f
+```
+
+Verify unit syntax:
+
+```bash
+systemd-analyze --user verify deploy/trade-agent.service
+```
+
+## Status
 
 Built:
 
 - [x] Backtest engine with next-bar fills and slippage/fee simulation
 - [x] MA crossover + RSI strategy
-- [x] Risk gate with latching kill switch and per-symbol cooldown
+- [x] Risk gate with kill switch and per-symbol cooldown
 - [x] Portfolio accounting and performance metrics
-- [x] Data layer — yfinance (stocks) and ccxt/Coinbase (crypto), normalized
-- [x] SQLite persistence with the full six-table schema and audit trail
-- [x] Live paper-trading loop, restart-safe and idempotent per bar
-- [x] Streamlit dashboard with manual halt controls
-- [x] Offline pytest suite
+- [x] Historical/live data layer with yfinance, ccxt, and Alpaca source
+- [x] SQLite persistence and restart-safe live state
+- [x] Broker execution interface
+- [x] Alpaca stock broker client
+- [x] ccxt crypto broker client with sandbox guard for paper mode
+- [x] Broker-side order reconciliation
+- [x] Discord webhook alerts
+- [x] Daily summaries
+- [x] Streamlit dashboard
+- [x] systemd user service deployment files
+- [x] Market-hours and correlated exposure checks
 
-Not built yet:
+Not done / intentionally deferred:
 
-- [ ] Real broker execution — Alpaca for stocks, ccxt for crypto, with
-      broker-side order-state reconciliation
-- [ ] `AlpacaDataSource` — currently a stub; needs API keys and `alpaca-py`
-- [ ] Discord webhook alerting for fills, errors, and daily summaries
-- [ ] Deployment as a systemd service with restart-on-crash
-- [ ] Correlation/exposure cap and market-hours checks (rules 9 and 10 in the notes)
+- [ ] Verified paper broker run with real Alpaca/ccxt credentials
+- [ ] Verified live-mode run with small capital
+- [ ] Options, bracket orders, trailing stops, margin, shorting, futures, and multi-leg orders
+- [ ] Dynamic statistical correlation calculation
+- [ ] Holiday/early-close market calendar beyond the current weekday/session check
 
-The intended order from here is paper trading for weeks, not days → alerting and
-hardening → small live capital, with the kill switch deliberately triggered once
-to confirm it actually halts. See `Trade agent notes.md` for the full plan.
-
-Nothing here has traded real money.
+Nothing here proves an edge. The test suite proves plumbing and guardrails; paper broker mode still needs real credential validation before live capital.

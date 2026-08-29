@@ -46,3 +46,28 @@ def test_record_price_keeps_price_sanity_anchor_fresh():
     # 104 vs last recorded 103 is within 5%, even though 104 vs the very
     # first price (100) would have exceeded it
     assert result.passed
+
+
+def test_market_hours_check_rejects_stock_when_enabled():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from engine import Signal
+    from portfolio import Portfolio
+
+    gate = RiskGate(RiskConfig(enforce_market_hours=True))
+    signal = Signal("AAPL", "buy", 1.0, 1.0, {"asset_type": "stock"})
+    ts = datetime.fromisoformat("2024-01-06T10:00:00").replace(tzinfo=ZoneInfo("America/New_York")).timestamp()
+    decision = gate.evaluate(signal, Portfolio(1000), {"AAPL": 100}, now_ts=ts)
+    assert any(r["rule_name"] == "market_hours" and not r["passed"] for r in decision.rule_results)
+
+
+def test_correlated_exposure_check_rejects_projected_bucket_over_cap():
+    from engine import Signal
+    from portfolio import Portfolio, Fill
+
+    p = Portfolio(1000)
+    p.apply_fill(Fill("MSFT", "buy", 3, 100, 0, 1), asset_type="stock")
+    gate = RiskGate(RiskConfig(max_correlated_exposure_pct=0.34))
+    signal = Signal("AAPL", "buy", 1.0, 1.0, {"asset_type": "stock"})
+    decision = gate.evaluate(signal, p, {"AAPL": 50, "MSFT": 100}, now_ts=2)
+    assert any(r["rule_name"] == "correlated_exposure" and not r["passed"] for r in decision.rule_results)

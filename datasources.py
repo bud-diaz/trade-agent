@@ -183,21 +183,87 @@ class CcxtDataSource(OHLCVDataSource):
 
 
 class AlpacaDataSource(OHLCVDataSource):
-    """Stub. Alpaca's market data API requires ALPACA_API_KEY/
-    ALPACA_SECRET_KEY even for historical bars, which aren't set up yet.
-    Deliberately does not import alpaca-py so it costs nothing until this
-    gets implemented for real."""
+    """Alpaca stock market data source backed by alpaca-py."""
 
     source_name = "alpaca"
+
+    def __init__(self, api_key: str | None = None, secret_key: str | None = None, client=None):
+        import os
+
+        self.api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
+        self.secret_key = secret_key if secret_key is not None else os.getenv("ALPACA_SECRET_KEY")
+        self._client = client
 
     def fetch_ohlcv(
         self, symbol: str, start: datetime, end: datetime, timeframe: str = "1d"
     ) -> pd.DataFrame:
-        raise NotImplementedError(
-            "AlpacaDataSource not yet implemented — set ALPACA_API_KEY and "
-            "ALPACA_SECRET_KEY in .env.local, add alpaca-py to requirements.txt, "
-            "then implement this method."
-        )
+        if not self.api_key or not self.secret_key:
+            raise DataSourceError("alpaca: missing ALPACA_API_KEY/ALPACA_SECRET_KEY")
+
+        tf = self._timeframe(timeframe)
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+        except Exception as exc:  # pragma: no cover - depends on optional package install
+            raise DataSourceError("alpaca: alpaca-py is not installed") from exc
+
+        client = self._client or StockHistoricalDataClient(self.api_key, self.secret_key)
+        try:
+            request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=tf, start=start, end=end)
+            raw = client.get_stock_bars(request)
+        except Exception as exc:  # noqa: BLE001
+            raise DataSourceError(f"alpaca: failed to fetch {symbol}: {exc}") from exc
+
+        df = getattr(raw, "df", raw)
+        if df is None or len(df) == 0:
+            raise DataSourceError(f"alpaca returned no data for {symbol} [{start} - {end}]")
+        return self._normalize(df, symbol)
+
+    @staticmethod
+    def _timeframe(timeframe: str):
+        try:
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        except Exception as exc:  # pragma: no cover
+            raise DataSourceError("alpaca: alpaca-py is not installed") from exc
+        mapping = {
+            "1d": TimeFrame.Day,
+            "1h": TimeFrame.Hour,
+            "5m": TimeFrame(5, TimeFrameUnit.Minute),
+            "1m": TimeFrame.Minute,
+        }
+        if timeframe not in mapping:
+            raise DataSourceError(f"alpaca: unsupported timeframe {timeframe!r}")
+        return mapping[timeframe]
+
+    @staticmethod
+    def _normalize(raw, symbol: str) -> pd.DataFrame:
+        df = raw.copy()
+        if isinstance(df.index, pd.MultiIndex):
+            if "symbol" in df.index.names:
+                try:
+                    df = df.xs(symbol, level="symbol")
+                except KeyError:
+                    pass
+            df = df.reset_index()
+        else:
+            df = df.reset_index()
+
+        rename = {"timestamp": "timestamp", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"}
+        df = df.rename(columns=rename)
+        if "timestamp" not in df.columns:
+            # alpaca-py sometimes exposes the reset index column as a generic name
+            candidates = [c for c in df.columns if "time" in str(c).lower() or c == "index"]
+            if not candidates:
+                raise DataSourceError("alpaca: response missing timestamp column")
+            df = df.rename(columns={candidates[0]: "timestamp"})
+        required = ["timestamp", "open", "high", "low", "close", "volume"]
+        missing = set(required) - set(df.columns)
+        if missing:
+            raise DataSourceError(f"alpaca: response missing columns {sorted(missing)}")
+        out = df[required].copy()
+        ts = pd.to_datetime(out["timestamp"], utc=True)
+        out["timestamp"] = ts.astype("int64") // 1_000_000_000
+        return out.sort_values("timestamp").reset_index(drop=True)
 
 
 def get_data_source(name: str) -> OHLCVDataSource:

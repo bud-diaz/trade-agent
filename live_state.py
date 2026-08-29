@@ -32,10 +32,10 @@ def reconstruct_portfolio(
 
     rows = conn.execute(
         """
-        SELECT symbol, side, filled_qty, filled_price, fee, filled_at
+        SELECT symbol, side, filled_qty, filled_price, avg_fill_price, fee, filled_at, submitted_at
         FROM orders
-        WHERE symbol = ? AND status = 'filled'
-        ORDER BY filled_at ASC, id ASC
+        WHERE symbol = ? AND COALESCE(filled_qty, 0) > 0 AND status IN ('filled', 'partially_filled')
+        ORDER BY COALESCE(filled_at, submitted_at) ASC, id ASC
         """,
         (symbol,),
     ).fetchall()
@@ -45,9 +45,9 @@ def reconstruct_portfolio(
             symbol=row["symbol"],
             side=row["side"],
             qty=row["filled_qty"],
-            price=row["filled_price"],
+            price=row["avg_fill_price"] or row["filled_price"],
             fee=row["fee"] or 0.0,
-            timestamp=row["filled_at"],
+            timestamp=row["filled_at"] or row["submitted_at"],
         )
         portfolio.apply_fill(fill, asset_type=asset_type)
 

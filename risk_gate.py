@@ -15,6 +15,8 @@ from typing import Optional
 import time
 
 from engine import Signal, RiskDecision
+from exposure import CORRELATION_BUCKETS, projected_bucket_exposure_pct
+from market_hours import is_market_open
 
 
 @dataclass
@@ -25,11 +27,16 @@ class RiskConfig:
     min_cash_buffer_pct: float = 0.15           # never let free cash drop below 15% of equity
     max_price_deviation_pct: float = 0.05       # reject if price jumped >5% from last known good
     max_data_staleness_seconds: int = 300        # reject if last price update older than 5 min
+    enforce_market_hours: bool = False           # live loop enables this for broker execution
+    allow_extended_hours: bool = False
+    market_timezone: str = "America/New_York"
 
     # portfolio-level
     max_open_positions: int = 8
     max_daily_loss_pct: float = 0.03             # kill switch: halt if daily loss exceeds 3% of equity
     max_daily_trade_count: int = 20
+    max_correlated_exposure_pct: float = 0.35
+    correlation_buckets: dict[str, set[str]] = field(default_factory=lambda: {k: set(v) for k, v in CORRELATION_BUCKETS.items()})
 
     # operational
     rejection_cooldown_count: int = 3            # N consecutive rejections -> blacklist symbol temporarily
@@ -104,6 +111,8 @@ class RiskGate:
         results.append(self._check_max_open_positions(signal, portfolio))
         results.append(self._check_daily_loss(portfolio, current_prices))
         results.append(self._check_daily_trade_count())
+        results.append(self._check_market_hours(signal, now_ts))
+        results.append(self._check_correlated_exposure(signal, portfolio, current_prices))
 
         return self._finalize(signal, results, now_ts)
 
@@ -246,6 +255,41 @@ class RiskGate:
                 f"{self.daily_trade_count} trades today, max {self.config.max_daily_trade_count}"
             )
         return RuleResult("max_daily_trade_count", True, f"{self.daily_trade_count} trades today")
+
+
+    def _asset_type_for_signal(self, signal: Signal) -> str:
+        asset_type = getattr(signal, "asset_type", None)
+        if asset_type is None and getattr(signal, "inputs", None):
+            asset_type = signal.inputs.get("asset_type")
+        if asset_type:
+            return asset_type
+        return "crypto" if "/" in signal.symbol else "stock"
+
+    def _check_market_hours(self, signal: Signal, now_ts: float) -> RuleResult:
+        if not self.config.enforce_market_hours:
+            return RuleResult("market_hours", True, "disabled")
+        asset_type = self._asset_type_for_signal(signal)
+        if is_market_open(asset_type, now_ts, self.config.market_timezone, self.config.allow_extended_hours):
+            return RuleResult("market_hours", True, f"{asset_type} market open")
+        return RuleResult("market_hours", False, f"{asset_type} market closed")
+
+    def _check_correlated_exposure(self, signal: Signal, portfolio, current_prices: dict[str, float]) -> RuleResult:
+        if signal.action != "buy":
+            return RuleResult("correlated_exposure", True, "not a buy, skipped")
+        price = current_prices.get(signal.symbol)
+        if price is None:
+            return RuleResult("correlated_exposure", False, "no current price available")
+        pct, bucket = projected_bucket_exposure_pct(
+            signal.symbol, signal.action, signal.suggested_qty, price, portfolio, current_prices, self.config.correlation_buckets
+        )
+        if bucket is None:
+            return RuleResult("correlated_exposure", True, "no correlation bucket")
+        if pct > self.config.max_correlated_exposure_pct:
+            return RuleResult(
+                "correlated_exposure", False,
+                f"bucket {bucket} would be {pct:.1%} of equity, max {self.config.max_correlated_exposure_pct:.1%}"
+            )
+        return RuleResult("correlated_exposure", True, f"bucket {bucket} {pct:.1%} of equity")
 
     # ------------------------------------------------------------------
     # Halt / cooldown management
